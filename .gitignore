@@ -1,0 +1,7 @@
+__pycache__
+.vscode
+img
+models
+*.so
+*.weights
+*.mp4
