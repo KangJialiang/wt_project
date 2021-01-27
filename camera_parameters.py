@@ -18,9 +18,9 @@ p1 = -0.000288373571966727
 p2 = 0.000262603352527099
 camera_height = 0.6
 # rotation_matrix = torch.eye(3)
-rotation_vector = np.array([[-1.49343908],
-                            [0.16285063],
-                            [-0.13732823]])
+rotation_vector = np.array([[-1.5035],
+                            [0.03125],
+                            [-0.06]])
 
 rotation_matrix, _ = cv2.Rodrigues(rotation_vector)
 rotation_matrix = torch.FloatTensor(rotation_matrix)
