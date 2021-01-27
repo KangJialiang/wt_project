@@ -360,9 +360,7 @@ def main():
         cv2.imshow("Test camera", frame)
         cv2.imshow("Result", result)
 
-        # cv2.waitKey(0)
-        # break
-
+        # do detection
         detections = detection(
             darknet_network, class_names, class_colors, frame)
         detections = np.array(detections)

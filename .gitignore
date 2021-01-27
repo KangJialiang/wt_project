@@ -5,3 +5,4 @@ models
 *.so
 *.weights
 *.mp4
+temp*
