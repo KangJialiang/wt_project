@@ -12,7 +12,6 @@ import matplotlib.cm as cm
 import numpy as np
 import PIL.Image as pil
 import torch
-from numpy.lib.function_base import append
 from torchvision import transforms
 
 import camera_parameters as params
@@ -21,9 +20,6 @@ import monodepth2.networks as networks
 from camera_parameters import *
 from deep_sort import build_tracker
 from deep_sort.parser import *
-
-# This speeds up evaluation 5x on our unix systems (OpenCV 3.3.1)
-cv2.setNumThreads(0)
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -206,6 +202,7 @@ def pixelcoord_to_worldcoord(depth_matrix, intrinsic_matrix, inv_extrinsics_matr
     ones = torch.ones(depth_vector.size()).to(device)
 
     P_cam = torch.stack((u, v, depth_vector, ones), dim=0)
+    # [x: crosswise ,y: -lengthwise, z: vertical, 1]
     P_w = torch.mm(inv_extrinsics_matrix, P_cam)
 
     # np.savetxt('P_cam.txt', P_cam.cpu().numpy()[:, :10])
@@ -214,25 +211,32 @@ def pixelcoord_to_worldcoord(depth_matrix, intrinsic_matrix, inv_extrinsics_matr
     return P_w
 
 
-def get_scale(relative_disp: torch.tensor, intrinsic_matrix: torch.tensor, inv_extrinsics_matrix: torch.tensor,
-              camera_height: float, pixel_indexs, portion=1):
-    if portion < 1:
-        mask = torch.bernoulli(torch.ones(relative_disp.size()[0]//4,
-                                          relative_disp.size()[1]//4)*portion)
+def get_mask(x_left, y_top, x_right, y_bottom, to_size, portion=1):
+    """Edges all included"""
+
+    if portion > 0 and portion < 1:
+        mask = torch.bernoulli(
+            torch.ones(y_bottom-y_top+1, x_right-x_left+1)*portion)
     else:
-        mask = torch.ones(relative_disp.size()[0]//4,
-                          relative_disp.size()[1]//4)
-
+        mask = torch.ones(y_bottom-y_top+1, x_right-x_left+1)
     padding = (
-        (relative_disp.size()[1]-mask.size()[1])//2,
-        relative_disp.size()[1]-mask.size()[1] -
-        (relative_disp.size()[1]-mask.size()[1])//2,
-
-        relative_disp.size()[0]-mask.size()[0] -
-        (relative_disp.size()[0]-mask.size()[0])//10,
-        (relative_disp.size()[0]-mask.size()[0])//10)
+        x_left,  # padding in left
+        to_size[1]-x_right-1,  # padding in right
+        y_top,  # padding in top
+        to_size[0]-y_bottom-1  # padding in bottom
+    )
     mask = torch.nn.functional.pad(
         mask, padding,  mode="constant", value=0).type(torch.bool).to(device)
+    return mask
+
+
+def get_scale(relative_disp: torch.tensor, intrinsic_matrix: torch.tensor, inv_extrinsics_matrix: torch.tensor,
+              camera_height: float, pixel_indexs, portion=1):
+    mask = get_mask(relative_disp.size()[1]*3//8,
+                    relative_disp.size()[0]*27//40,
+                    relative_disp.size()[1]*5//8,
+                    relative_disp.size()[0]*37//40,
+                    relative_disp.size(), portion=portion)
     road_points = relative_disp*mask
 
     P_w = pixelcoord_to_worldcoord(road_points, intrinsic_matrix,
@@ -268,6 +272,7 @@ def detection(darknet_network, class_names, class_colors, frame, confidence_thre
 
     detections = darknet.detect_image(
         darknet_network, class_names, img_for_detect, thresh=confidence_thresh)
+    darknet.free_image(img_for_detect)
     detections_resized = []
     for label, confidence, bbox in detections:
         x, y, w, h = bbox
@@ -287,9 +292,9 @@ def main():
     # camera = CameraCapture((gstreamer_pipeline(
     #     (gstreamer_pipeline(), cv2.CAP_GSTREAMER), intrinsic_matrix, dist_coeffs)
 
-    cv2.namedWindow("Test camera")
-    cv2.namedWindow("Result")
-    cv2.namedWindow("MultiTracker")
+    # cv2.namedWindow("Test camera")
+    # cv2.namedWindow("Result")
+    # cv2.namedWindow("MultiTracker")
 
     # choices = ["mono_640x192",
     #            "stereo_640x192",
@@ -316,18 +321,23 @@ def main():
     pixel_indexs = torch.tensor([[v, u]
                                  for v in range(frame.shape[0])
                                  for u in range(frame.shape[1])]).t().to(device)
+
+    last_y = dict()
+    temp_index = 0
+
     while success:
+        last_time = time.time()
         key = cv2.waitKey(1)
-        if key == 27 or not success or\
-                cv2.getWindowProperty("Test camera", cv2.WND_PROP_AUTOSIZE) < 1 or\
-                cv2.getWindowProperty("Result", cv2.WND_PROP_AUTOSIZE) < 1 or\
-                cv2.getWindowProperty("MultiTracker", cv2.WND_PROP_AUTOSIZE) < 1:
-            # if key == 27 or not success:
+        # if key == 27 or not success or\
+        #         cv2.getWindowProperty("Test camera", cv2.WND_PROP_AUTOSIZE) < 1 or\
+        #         cv2.getWindowProperty("Result", cv2.WND_PROP_AUTOSIZE) < 1 or\
+        #         cv2.getWindowProperty("MultiTracker", cv2.WND_PROP_AUTOSIZE) < 1:
+        if key == 27 or not success:
             break
         if key == ord(']'):
             continue
 
-        success, frame = camera.read()
+        # do depth estimation
         rel_disp = get_relative_depth(
             frame,  feed_height, feed_width, encoder, depth_decoder)
         scale = get_scale(rel_disp, intrinsic_matrix,
@@ -336,34 +346,34 @@ def main():
         P_w = pixelcoord_to_worldcoord(true_disp, intrinsic_matrix,
                                        inv_extrinsics_matrix, pixel_indexs)
 
-        disp_resized_np = true_disp.cpu().numpy()
+        # disp_resized_np = true_disp.cpu().numpy()
 
-        vmax = 10
-        vmin = 0
-        # vmax = np.percentile(disp_resized_np, 95)
-        # vmin = disp_resized_np.min()
-        # print(vmin, vmax)
-        normalizer = mpl.colors.Normalize(
-            vmin=vmin, vmax=vmax)
-        legend = np.linspace(vmax, vmin,
-                             disp_resized_np.shape[0])[np.newaxis, :].T
-        disp_resized_np = np.hstack(
-            (disp_resized_np,
-             np.tile(np.zeros(disp_resized_np.shape[0])[
-                     np.newaxis, :].T, 1),
-             np.tile(legend, 100)))
-        mapper = cm.ScalarMappable(norm=normalizer, cmap="magma")
-        colormapped_im = (mapper.to_rgba(disp_resized_np)[
-            :, :, :3] * 255).astype(np.uint8)
-        result = cv2.cvtColor(colormapped_im, cv2.COLOR_RGB2BGR)
+        # vmax = 10
+        # vmin = 0
+        # # vmax = np.percentile(disp_resized_np, 95)
+        # # vmin = disp_resized_np.min()
+        # # print(vmin, vmax)
+        # normalizer = mpl.colors.Normalize(
+        #     vmin=vmin, vmax=vmax)
+        # legend = np.linspace(vmax, vmin,
+        #                      disp_resized_np.shape[0])[np.newaxis, :].T
+        # disp_resized_np = np.hstack(
+        #     (disp_resized_np,
+        #      np.tile(np.zeros(disp_resized_np.shape[0])[
+        #              np.newaxis, :].T, 1),
+        #      np.tile(legend, 100)))
+        # mapper = cm.ScalarMappable(norm=normalizer, cmap="magma")
+        # colormapped_im = (mapper.to_rgba(disp_resized_np)[
+        #     :, :, :3] * 255).astype(np.uint8)
+        # result = cv2.cvtColor(colormapped_im, cv2.COLOR_RGB2BGR)
 
-        cv2.imshow("Test camera", frame)
-        cv2.imshow("Result", result)
+        # cv2.imshow("Test camera", frame)
+        # cv2.imshow("Result", result)
 
         # do detection
         detections = detection(
             darknet_network, class_names, class_colors, frame)
-        detections = np.array(detections)
+        detections = np.array(detections, dtype=object)
         if detections.size > 0:
             bbox_xywh = np.array([np.array(xywh) for xywh in detections[:, 2]])
             cls_conf = detections[:, 1].astype(np.float)
@@ -373,13 +383,52 @@ def main():
 
         # do tracking
         outputs = deepsort.update(bbox_xywh, cls_conf, frame)
+
+        # plot result
+        font = cv2.FONT_HERSHEY_DUPLEX
+        font_thickness = 1
         for output in outputs:
             x1, y1, x2, y2, id = output
             random.seed(id)
+            color = (random.randint(0, 255),
+                     random.randint(0, 255),
+                     random.randint(0, 255))
             cv2.rectangle(frame, (x1, y1), (x2, y2),
-                          (0, 0, random.randint(0, 255)), 2)
+                          color, 2)
+            mask = get_mask(x1+(x2-x1)//10, y1+(y2-y1)//10,
+                            x2-(x2-x1)//10, y2-(y2-y1)//10, frame.shape)
+            x_coords = torch.masked_select(P_w[0, :], mask.view(-1))  # 选取x坐标
+            x_distance = torch.median(x_coords)
+            y_coords = torch.masked_select(P_w[1, :], mask.view(-1))  # 选取y坐标
+            y_distance = torch.median(y_coords)
+            z_coords = torch.masked_select(P_w[2, :], mask.view(-1))  # 选取z坐标
+            z_distance = torch.median(z_coords)
+            if id in last_y:
+                speed = (last_y[id]+y_distance)/0.1244
+            else:
+                speed = 0
+            last_y[id] = -y_distance
+            text_line1 = f"y:{-y_distance:0.2f}m"
+            text_line2 = f"speed:{speed:0.2f}m/s"
+            font_scale = 0.8
+            cv2.putText(frame, text_line1, (x2, y1), font,
+                        font_scale, color, font_thickness, cv2.LINE_AA)
+            size_line1 = cv2.getTextSize(
+                text_line1, font, font_scale, font_thickness)[0]
+            cv2.putText(frame, text_line2, (x2, y1+size_line1[1]), font,
+                        font_scale, color, font_thickness, cv2.LINE_AA)
 
-        cv2.imshow("MultiTracker", frame)
+        font_scale = 2
+        fps_text = f"FPS:{1/(time.time()-last_time):0.1f}"
+        size_fps_text = cv2.getTextSize(
+            fps_text, font, font_scale, font_thickness)[0]
+        cv2.putText(frame, fps_text, (frame.shape[0]-size_fps_text[0], size_fps_text[1]), font,
+                    font_scale, (0, 0, 255), font_thickness, cv2.LINE_AA)
+        # cv2.imshow("MultiTracker", frame)
+        cv2.imwrite(f'./temp/{temp_index}.jpg', frame)
+        temp_index += 1
+
+        success, frame = camera.read()
 
     camera.release()
     cv2.destroyAllWindows()
