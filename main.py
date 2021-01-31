@@ -21,10 +21,6 @@ from camera_parameters import *
 from deep_sort import build_tracker
 from deep_sort.parser import *
 
-<<<<<<< HEAD
-=======
-
->>>>>>> 7f13cc01e7b917a9d9b8092a74112c9221d9b958
 if torch.cuda.is_available():
     device = torch.device("cuda")
 else:
