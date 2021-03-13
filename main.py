@@ -1,4 +1,5 @@
 import glob
+import json
 import os
 import queue
 import random
@@ -19,7 +20,9 @@ import darknet.darknet as darknet
 import monodepth2.networks as networks
 from camera_parameters import *
 from deep_sort import build_tracker
-from deep_sort.parser import *
+from deep_sort.parser import get_config
+from kalman_filter import KalmanFilter
+from monodepth2.layers import disp_to_depth
 
 if torch.cuda.is_available():
     device = torch.device("cuda")
@@ -127,6 +130,61 @@ class FileCapture():
         return success_flag, frame
 
 
+class Trajectory():
+    def __init__(self, max_age=50, max_error=0.1):
+        self.max_age = max_age
+        self.max_error = max_error
+
+        self.objects = dict()
+        self.index = 0
+
+    def __delete_out_dated(self):
+        to_be_deleted = []
+
+        for obj_id, coords_dict in self.objects.items():
+            last_index = max([key for key in coords_dict.keys()])
+            if self.index-last_index > self.max_age:
+                to_be_deleted.append(obj_id)
+
+        for index in to_be_deleted:
+            self.objects.pop(index)
+
+    def update(self, coords, ids):
+        self.__delete_out_dated()
+
+        for i, id in enumerate(ids):
+            if id not in self.objects.keys():
+                self.objects[id] = {self.index: coords[i]}
+            else:
+                if self.index-1 in self.objects[id]:
+                    self.objects[id][self.index] = coords[i]
+                else:
+                    last_index = max([key for key in self.objects[id].keys()])
+                    for index in range(last_index+1, self.index+1):
+                        last_coord = self.objects[id][last_index]
+                        current_coord = coords[i]
+                        self.objects[id][index] = [last_coord[coord]+(current_coord[coord]-last_coord[coord])*(
+                            index-last_index)/(self.index-last_index) for coord in range(len(coords[i]))]
+
+        self.index += 1
+
+    def get_nearest(self, distance) -> dict:
+        distance_dict = dict()
+        min_delta = float("inf")
+        for obj_id, coords_dict in self.objects.items():
+            last_index = max([key for key in coords_dict.keys()])
+            current_coord = coords_dict[last_index]
+            current_distance = (sum(x**2 for x in current_coord))**.5
+            distance_dict[obj_id] = current_distance
+        for obj_id, obj_distance in distance_dict.items():
+            if abs(obj_distance-distance) < min_delta:
+                min_delta = abs(obj_distance-distance)
+                best_match = obj_id
+        if min_delta < self.max_error:
+            return self.objects[best_match]
+        return None
+
+
 def init_monodepth_model(model_name):
     """Function to predict for a single image or folder of images
     """
@@ -182,7 +240,9 @@ def get_relative_depth(frame, feed_height, feed_width, encoder, depth_decoder):
         disp_resized = torch.nn.functional.interpolate(
             disp, (original_height, original_width), mode="bilinear", align_corners=False)  # 插值成源图像大小
 
-        return disp_resized.squeeze().reciprocal()
+        _, depth = disp_to_depth(disp_resized, 0.1, 100)
+
+        return depth
 
 
 def pixelcoord_to_worldcoord(depth_matrix, intrinsic_matrix, inv_extrinsics_matrix, pixel_indexs):
@@ -230,8 +290,16 @@ def get_mask(x_left, y_top, x_right, y_bottom, to_size, portion=1):
     return mask
 
 
+def find_diff(last_frame, current_frame, threshold=10):
+    diff = cv2.absdiff(last_frame, current_frame)
+    diff = cv2.cvtColor(diff, cv2.COLOR_BGR2GRAY)
+    static_points = torch.from_numpy((diff < threshold)).to(device)
+
+    return static_points
+
+
 def get_scale(relative_disp: torch.tensor, intrinsic_matrix: torch.tensor, inv_extrinsics_matrix: torch.tensor,
-              camera_height: float, pixel_indexs, portion=1):
+              camera_height: float, pixel_indexs, current_frame, last_frame, last_true_disp, portion=1):
     mask = get_mask(relative_disp.size()[1]*3//8,
                     relative_disp.size()[0]*27//40,
                     relative_disp.size()[1]*5//8,
@@ -247,7 +315,17 @@ def get_scale(relative_disp: torch.tensor, intrinsic_matrix: torch.tensor, inv_e
     mean = torch.mean(rel_heights)
     threshold_mask = torch.lt(torch.abs(rel_heights-mean), std)
     rel_heights = torch.masked_select(rel_heights, threshold_mask.view(-1))
-    scale = camera_height/(rel_heights.sum()/rel_heights.shape[0])
+    scale_camera_height_based = camera_height / \
+        (rel_heights.sum()/rel_heights.shape[0])
+
+    if last_frame is not None and last_true_disp is not None:
+        static_points = find_diff(last_frame, current_frame)
+        scale_static_points_based = torch.sum(last_true_disp*static_points.reshape_as(last_true_disp)) /\
+            torch.sum(relative_disp*static_points.reshape_as(relative_disp))
+        scale = .1*scale_camera_height_based+0.9*scale_static_points_based
+        # print(torch.sum(static_points) / last_true_disp.numel())
+    else:
+        scale = scale_camera_height_based
 
     return scale
 
@@ -285,12 +363,41 @@ def detection(darknet_network, class_names, class_colors, frame, confidence_thre
     return detections_resized
 
 
+def get_coordinates(P_w, outputs, frame):
+    measurement_list = []
+    id_list = []
+    for output in outputs:
+        x1, y1, x2, y2, id = output
+        # mask = get_mask(x1+(x2-x1)//10, y1+(y2-y1)//10,
+        #                 x2-(x2-x1)//10, y2-(y2-y1)//10, frame.shape)
+        mask = get_mask(x1, y1, x2, y2, frame.shape)
+        x_coords = torch.masked_select(P_w[0, :], mask.view(-1))
+        y_coords = torch.masked_select(P_w[1, :], mask.view(-1))
+        z_coords = torch.masked_select(P_w[2, :], mask.view(-1))
+        coords = torch.stack((x_coords, y_coords, z_coords), dim=0)
+        distance_w = torch.norm(coords, p=2, dim=0)
+        min_distance = torch.min(distance_w)
+        index = (distance_w == min_distance).nonzero().flatten()[0]
+        x_distance = float(coords[0, index])
+        y_distance = float(coords[1, index])
+        z_distance = float(coords[2, index])
+        measurement_list.append([x_distance, y_distance, z_distance])
+        id_list.append(id)
+    return measurement_list, id_list
+
+
+# @profile
 def main():
-    intrinsic_matrix = params.intrinsic_matrix
+    # # read form camera
+    # intrinsic_matrix = params.intrinsic_matrix
     # camera = CameraCapture((0,), intrinsic_matrix, dist_coeffs)
-    camera = FileCapture("./img")
-    # camera = CameraCapture((gstreamer_pipeline(
+
+    # camera = CameraCapture(
     #     (gstreamer_pipeline(), cv2.CAP_GSTREAMER), intrinsic_matrix, dist_coeffs)
+
+    # read form file
+    camera = FileCapture("./img")
+    intrinsic_matrix = camera.intrinsic_matrix
 
     # cv2.namedWindow("Test camera")
     # cv2.namedWindow("Result")
@@ -306,15 +413,33 @@ def main():
     #            "stereo_1024x320",
     #            "mono+stereo_1024x320"]
 
-    intrinsic_matrix = camera.intrinsic_matrix
+    # initiate monodepth
     feed_height, feed_width, encoder, depth_decoder = init_monodepth_model(
         "mono_640x192")
+
+    # initiate yolo
     darknet_network, class_names, class_colors = init_darknet_network(config_file="./darknet/yolo-obj.cfg",
                                                                       data_file="./darknet/data/obj.data",
                                                                       weights_file="./darknet/yolo-obj.weights")
+
+    # initiate deep track
     cfg = get_config()
     cfg.merge_from_file("deep_sort/configs/deep_sort.yaml")
     deepsort = build_tracker(cfg, use_cuda=torch.cuda.is_available())
+
+    # initiate Kalman filter
+    measurement_matrix = np.array(
+        [[1, 0, 0, 0, 0, 0], [0, 1, 0, 0, 0, 0], [0, 0, 1, 0, 0, 0]], np.float32)
+    transition_matrix = np.array(
+        [[1, 0, 0, 1, 0, 0], [0, 1, 0, 0, 1, 0], [0, 0, 1, 0, 0, 1],
+         [0, 0, 0, 1, 0, 0], [0, 0, 0, 0, 1, 0], [0, 0, 0, 0, 0, 1]], np.float32)
+    process_noise_cov = np.eye(6, dtype=np.float32) * 1e-3
+    measurement_noise_cov = np.eye(3, dtype=np.float32) * 1e-1
+    kalman_filter = KalmanFilter(6, 3, measurement_matrix,
+                                 transition_matrix, process_noise_cov, measurement_noise_cov)
+
+    # initiate trajectory recorder
+    trajectory_recorder = Trajectory()
 
     success, frame = camera.read()
 
@@ -322,53 +447,36 @@ def main():
                                  for v in range(frame.shape[0])
                                  for u in range(frame.shape[1])]).t().to(device)
 
+    last_frame = None
+    last_true_disp = None
+
     last_y = dict()
-    temp_index = 0
+    time_serial_index = 0
 
     while success:
-        last_time = time.time()
-        key = cv2.waitKey(1)
-        # if key == 27 or not success or\
-        #         cv2.getWindowProperty("Test camera", cv2.WND_PROP_AUTOSIZE) < 1 or\
-        #         cv2.getWindowProperty("Result", cv2.WND_PROP_AUTOSIZE) < 1 or\
-        #         cv2.getWindowProperty("MultiTracker", cv2.WND_PROP_AUTOSIZE) < 1:
-        if key == 27 or not success:
-            break
-        if key == ord(']'):
-            continue
+        last_run_time = time.time()
+
+        # key = cv2.waitKey(1)
+        # # if key == 27 or not success or\
+        # #         cv2.getWindowProperty("Test camera", cv2.WND_PROP_AUTOSIZE) < 1 or\
+        # #         cv2.getWindowProperty("Result", cv2.WND_PROP_AUTOSIZE) < 1 or\
+        # #         cv2.getWindowProperty("MultiTracker", cv2.WND_PROP_AUTOSIZE) < 1:
+        # if key == 27 or not success:
+        #     break
+        # if key == ord(']'):
+        #     continue
 
         # do depth estimation
         rel_disp = get_relative_depth(
             frame,  feed_height, feed_width, encoder, depth_decoder)
         scale = get_scale(rel_disp, intrinsic_matrix,
-                          inv_extrinsics_matrix, camera_height, pixel_indexs)
+                          inv_extrinsics_matrix, camera_height, pixel_indexs,
+                          frame, last_frame, last_true_disp)
         true_disp = rel_disp*scale
         P_w = pixelcoord_to_worldcoord(true_disp, intrinsic_matrix,
                                        inv_extrinsics_matrix, pixel_indexs)
-
-        # disp_resized_np = true_disp.cpu().numpy()
-
-        # vmax = 10
-        # vmin = 0
-        # # vmax = np.percentile(disp_resized_np, 95)
-        # # vmin = disp_resized_np.min()
-        # # print(vmin, vmax)
-        # normalizer = mpl.colors.Normalize(
-        #     vmin=vmin, vmax=vmax)
-        # legend = np.linspace(vmax, vmin,
-        #                      disp_resized_np.shape[0])[np.newaxis, :].T
-        # disp_resized_np = np.hstack(
-        #     (disp_resized_np,
-        #      np.tile(np.zeros(disp_resized_np.shape[0])[
-        #              np.newaxis, :].T, 1),
-        #      np.tile(legend, 100)))
-        # mapper = cm.ScalarMappable(norm=normalizer, cmap="magma")
-        # colormapped_im = (mapper.to_rgba(disp_resized_np)[
-        #     :, :, :3] * 255).astype(np.uint8)
-        # result = cv2.cvtColor(colormapped_im, cv2.COLOR_RGB2BGR)
-
-        # cv2.imshow("Test camera", frame)
-        # cv2.imshow("Result", result)
+        last_frame = frame
+        last_true_disp = true_disp
 
         # do detection
         detections = detection(
@@ -384,6 +492,30 @@ def main():
         # do tracking
         outputs = deepsort.update(bbox_xywh, cls_conf, frame)
 
+        # get coordinates
+        coords, ids = get_coordinates(P_w, outputs, frame)
+
+        # do kalman filting
+        filtered = kalman_filter.update(coords, ids)
+
+        # record trajectory
+        trajectory_recorder.update([filtered[index] for index in ids], ids)
+
+        # # get depth image
+        # disp_resized_np = -P_w[1, :].cpu().numpy().reshape(
+        #     frame.shape[0], frame.shape[1])
+        # # Saving colormapped depth image
+        # vmax = np.percentile(disp_resized_np, 95)
+        # # normalizer = mpl.colors.Normalize(
+        # #     vmin=disp_resized_np.min(), vmax=vmax)
+        # normalizer = mpl.colors.Normalize(vmin=0, vmax=20)
+        # # print(f"min: {disp_resized_np.min()}\tmax: {vmax}")
+        # mapper = cm.ScalarMappable(norm=normalizer, cmap='magma')
+        # colormapped_im = (mapper.to_rgba(disp_resized_np)[
+        #     :, :, :3] * 255).astype(np.uint8)
+        # im = pil.fromarray(colormapped_im)
+        # # im.save(f'./temp/{temp_index}_disp.jpg')
+
         # plot result
         font = cv2.FONT_HERSHEY_DUPLEX
         font_thickness = 1
@@ -395,14 +527,9 @@ def main():
                      random.randint(0, 255))
             cv2.rectangle(frame, (x1, y1), (x2, y2),
                           color, 2)
-            mask = get_mask(x1+(x2-x1)//10, y1+(y2-y1)//10,
-                            x2-(x2-x1)//10, y2-(y2-y1)//10, frame.shape)
-            x_coords = torch.masked_select(P_w[0, :], mask.view(-1))  # 选取x坐标
-            x_distance = torch.median(x_coords)
-            y_coords = torch.masked_select(P_w[1, :], mask.view(-1))  # 选取y坐标
-            y_distance = torch.median(y_coords)
-            z_coords = torch.masked_select(P_w[2, :], mask.view(-1))  # 选取z坐标
-            z_distance = torch.median(z_coords)
+
+            x_distance, y_distance, z_distance = filtered[id]
+
             if id in last_y:
                 speed = (last_y[id]+y_distance)/0.1244
             else:
@@ -419,18 +546,25 @@ def main():
                         font_scale, color, font_thickness, cv2.LINE_AA)
 
         font_scale = 2
-        fps_text = f"FPS:{1/(time.time()-last_time):0.1f}"
+        fps_text = f"FPS:{1/(time.time()-last_run_time):0.1f}"
         size_fps_text = cv2.getTextSize(
             fps_text, font, font_scale, font_thickness)[0]
         cv2.putText(frame, fps_text, (frame.shape[0]-size_fps_text[0], size_fps_text[1]), font,
                     font_scale, (0, 0, 255), font_thickness, cv2.LINE_AA)
+
         # cv2.imshow("MultiTracker", frame)
-        cv2.imwrite(f'./temp/{temp_index}.jpg', frame)
-        temp_index += 1
+        # cv2.imwrite(f'./temp/{temp_index}.jpg', frame)
+
+        print(f"index: {time_serial_index}")
+
+        # if time_serial_index == 50:
+        #     break
 
         success, frame = camera.read()
+        time_serial_index += 1
 
     camera.release()
+
     cv2.destroyAllWindows()
 
 
